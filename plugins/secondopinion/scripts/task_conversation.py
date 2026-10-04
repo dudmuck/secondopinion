@@ -338,11 +338,12 @@ def deliver(conversation, task_id, message_id, session, cli, timeout, retry=Fals
             if previous['sequence'] < message['sequence'] and previous['delivery']['state'] not in ('delivered', 'superseded'):
                 raise ValueError('earlier lead message has unconfirmed delivery: ' + previous['id'] +
                                  '; deliver or reconcile it before sending this message')
-        # A name can now belong to a replacement session. Check UUID and checkout
-        # again for every new attempt, even though the original task route is fixed.
+        # A name can now belong to a replacement session, or the bound session can
+        # be renamed. Check UUID and checkout again for every new attempt, and
+        # address the session's current name; the original task route is fixed.
         from worker_directory import Directory
-        name = Directory(box).bound(task)['name']
-        task = dict(task, worker_name=name)
+        current = Directory(box).bound(task)
+        task = dict(task, worker_name=current['name'], worker_renamed_from=current.get('renamed_from'))
         attempt = str(uuid.uuid4())
         expected_state = message['delivery']['state']
         expected_attempt = message['delivery']['attempt']
@@ -382,6 +383,8 @@ def deliver(conversation, task_id, message_id, session, cli, timeout, retry=Fals
         from relay_diagnostics import observe, record_message
         details = observe(box.store, exchange, exit_code)
         details['attempt'] = attempt
+        if task['worker_renamed_from']:
+            details.update(worker_name=task['worker_name'], worker_renamed_from=task['worker_renamed_from'])
         notification = None
         if message['delivery']['receipt']:
             details.update(stage='receipt', reason='receipt_persisted')

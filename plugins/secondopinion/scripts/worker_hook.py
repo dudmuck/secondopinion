@@ -76,11 +76,14 @@ def notify(box, task):
         emitted = task['state'] == 'created' and row is not None and 0 <= time.time()-row['emitted'] < REPEAT_AFTER
     if not listening and not emitted:
         return dict(transport='worker_hook', state='not_listening')
-    # Sender still requires an exact public name, UUID and checkout binding.
+    # Sender still requires the exact UUID and checkout, and a unique current name.
     from worker_directory import Directory
-    Directory(box).bound(task)
-    return dict(transport='worker_hook', state='queued', worker_directory_match=True,
-                observation='watcher_listening' if listening else 'reminder_emitted')
+    current = Directory(box).bound(task)
+    result = dict(transport='worker_hook', state='queued', worker_directory_match=True,
+                  observation='watcher_listening' if listening else 'reminder_emitted')
+    if current.get('renamed_from'):
+        result.update(worker_name=current['name'], worker_renamed_from=current['renamed_from'])
+    return result
 
 
 def candidates(box, session, repo, conversation):

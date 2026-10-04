@@ -112,7 +112,8 @@ target and file contents; changing any of them is rejected. Message files must
 be nonempty UTF-8, at most 16 KiB. The mailbox snapshots them immediately.
 
 Lead messages use a listening worker hook or a bounded relay to the same existing worker. The plugin
-rechecks its UUID, unique name and checkout on every attempt. Worker messages
+rechecks its UUID and checkout on every attempt and sends to its current, unique
+name, so a worker renamed by a restart keeps its tasks. Worker messages
 are stored immediately and automatically notify the registered lead, including
 when idle, as `secondopinion_message`. Workers waiting for answers can end their
 turn; the lead's reply notifies that same worker through its hook or native relay.

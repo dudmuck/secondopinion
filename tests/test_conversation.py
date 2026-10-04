@@ -438,10 +438,30 @@ with mock.patch('worker_directory.Directory.rows', return_value=[dict(sessionId=
             self.assertIsNotNone(self.send()['acknowledged_utc'])
             relay.assert_not_called()
 
-    def test_replacement_renamed_wrong_checkout_or_ambiguous_worker_rejected(self):
+    def test_renamed_worker_is_addressed_by_its_current_name(self):
+        # A restart renamed the bound session; another session now holds the old name.
         self.post('answer', 'lead')
+        rows = [dict(self.rows()[0], name='bench-2'), dict(self.rows()[0], sessionId='other')]
+        prompts = []
+
+        def relay(cli, request, *args):
+            prompts.append(Path(request).read_text())
+            return self.receipt()
+        with mock.patch('worker_directory.Directory.rows', return_value=rows), \
+             mock.patch('relay_diagnostics.run_relay', side_effect=relay):
+            message = self.send()
+        self.assertEqual(message['delivery']['state'], 'delivered')
+        self.assertIn('now named "bench-2"', prompts[0])
+        self.assertIn('peer name "bench"', prompts[0])
+        self.assertIn('including the old one', prompts[0])
+        self.assertIn('"worker_renamed_from": "bench"', json.dumps(message['delivery_diagnostics']))
+        self.assertEqual(self.box.get('t')['worker_name'], 'bench')  # the requester's binding is kept
+
+    def test_replacement_wrong_checkout_or_ambiguous_worker_rejected(self):
+        self.post('answer', 'lead')
+        renamed = dict(self.rows()[0], name='renamed')
         for rows in ([], [dict(self.rows()[0], sessionId='replacement')],
-                     [dict(self.rows()[0], name='renamed')], [dict(self.rows()[0], cwd=str(self.root))],
+                     [renamed, dict(renamed, sessionId='other')], [dict(self.rows()[0], cwd=str(self.root))],
                      self.rows() * 2, self.rows() + [dict(self.rows()[0], sessionId='other')]):
             with self.subTest(rows=rows), mock.patch('worker_directory.Directory.rows', return_value=rows), \
                  mock.patch('relay_diagnostics.run_relay') as relay, self.assertRaises(ValueError):

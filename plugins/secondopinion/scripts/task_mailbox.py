@@ -420,7 +420,15 @@ complete before the requested work and its required restoration/validation have 
 def relay_prompt(task, cli, store, content=None, receipt_command=None):
     command = shlex.join(["env", f"SECONDOPINION_DIR={store}", cli, "task"])
     route = ""
-    if task["worker_name"]:
+    if task["worker_name"] and task.get("worker_renamed_from"):
+        route = f"""The requester bound this UUID to the peer name {json.dumps(task['worker_renamed_from'])}.
+A fresh public host-side worker listing shows the same session (same UUID and
+checkout) now named {json.dumps(task['worker_name'])}. Use that current name: require exactly
+one ListAgents peer with that exact name and send to its messaging reference. If
+ListAgents also exposes a UUID it must match the assigned UUID. Do not fall back to
+any other name, including the old one. If the current name is absent or ambiguous, fail.
+"""
+    elif task["worker_name"]:
         route = f"""The requester explicitly bound this UUID to the exact peer name
 {json.dumps(task['worker_name'])}, verified from a public host-side worker listing.
 Use this recorded name mapping: require exactly one ListAgents peer with that exact
@@ -507,9 +515,19 @@ def delegate(box, args):
             else:
                 delivery_state = 'unconfirmed'
         if not task["delivery_receipt"] and task["state"] == "created" and delivery_state == 'unconfirmed':
+            relay_task = task
+            if task["worker_name"]:
+                # A retry after the bound worker restarted must address its current name.
+                try:
+                    from worker_directory import Directory
+                    current = Directory(box).bound(task)
+                    if current.get("renamed_from"):
+                        relay_task = dict(task, worker_name=current["name"], worker_renamed_from=current["renamed_from"])
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    pass  # the relay itself still requires the recorded exact name
             with tempfile.TemporaryDirectory(prefix="task-relay-", dir=box.store) as tmp:
                 prompt = Path(tmp) / "request.md"
-                prompt.write_text(relay_prompt(task, args.cli, box.store), encoding="utf-8")
+                prompt.write_text(relay_prompt(relay_task, args.cli, box.store), encoding="utf-8")
                 # The sealed relay answer remains in its exchange. Do not print its
                 # narrative as if it were the delegated worker's final result.
                 exchange, exit_code = run_relay(args.cli, prompt, box.store, 'delivery ' + args.id[:100], args.delivery_timeout)
@@ -518,8 +536,10 @@ def delegate(box, args):
                 diagnostics['worker_directory_match'] = None
                 try:
                     from worker_directory import Directory, WorkerMismatch
-                    Directory(box).bound(task)
+                    current = Directory(box).bound(task)
                     diagnostics['worker_directory_match'] = True
+                    if current.get('renamed_from'):
+                        diagnostics.update(worker_name=current['name'], worker_renamed_from=current['renamed_from'])
                 except WorkerMismatch as error:
                     diagnostics['worker_directory_match'] = False
                     diagnostics['worker_directory_reason'] = str(error)

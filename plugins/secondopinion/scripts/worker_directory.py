@@ -108,7 +108,12 @@ class Directory:
         matches = [row for row in rows if row['sessionId'] == task['worker']]
         if len(matches) != 1 or matches[0]['cwd'] != task['repo']:
             raise WorkerMismatch('bound worker is absent, ambiguous or in a different checkout')
-        row = matches[0]
-        if (task['worker_name'] and row['name'] != task['worker_name']) or len([r for r in rows if r['name'] == row['name']]) != 1:
-            raise WorkerMismatch('bound worker name changed or became ambiguous')
+        row = dict(matches[0])
+        # The UUID and checkout identify the worker; a restart or rename changes only its
+        # display name. Senders address the current name, so it must be unique. The
+        # recorded route stays the requester's original binding.
+        if len([r for r in rows if r['name'] == row['name']]) != 1:
+            raise WorkerMismatch("bound worker's current name is ambiguous in the public listing")
+        if task['worker_name'] and row['name'] != task['worker_name']:
+            row['renamed_from'] = task['worker_name']
         return row

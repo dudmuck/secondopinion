@@ -17,6 +17,12 @@
 - When Codex's sandbox hides the app server, `delegate --async` now exits
   non-zero with the escalation and `wake register` commands to use, instead of
   a bare permission error. It does not fall back silently to polling.
+- Keep delivering to a bound Claude worker after a restart or rename changes
+  its session name. Senders still require the exact session UUID and checkout,
+  and now address the session's current name, which must be unique. The task
+  keeps the requester's original binding; the hook notice, relay prompt and
+  delivery diagnostics report both names. Previously every send failed with
+  `bound worker name changed or became ambiguous` until the name was restored.
 
 ## 1.2.3 — 2026-09-29
 

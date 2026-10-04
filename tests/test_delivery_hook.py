@@ -202,10 +202,47 @@ class DeliveryTests(unittest.TestCase):
 
     def test_public_binding_refuses_replacement_and_duplicate_name(self):
         row = dict(sessionId=self.worker,name='peer',cwd=str(self.root))
+        renamed = dict(row,name='changed')
         for rows in ([dict(row,sessionId=str(uuid.uuid4()))], [row,dict(row,sessionId=str(uuid.uuid4()))],
-                     [dict(row,cwd=str(self.root/'other'))], [dict(row,name='changed')]):
+                     [dict(row,cwd=str(self.root/'other'))], [renamed,dict(renamed,sessionId=str(uuid.uuid4()))],
+                     [dict(renamed,cwd=str(self.root/'other'))]):
             with mock.patch.object(Directory,'rows',return_value=rows), self.assertRaises(ValueError):
                 Directory(self.box).bound(self.task)
+
+    def test_public_binding_follows_a_rename_of_the_same_session(self):
+        # Same UUID and checkout; a restart gave it a new unique name, even with the old name reused.
+        row = dict(sessionId=self.worker,name='peer',cwd=str(self.root))
+        for rows in ([dict(row,name='peer-2')], [dict(row,name='peer-2'),dict(row,sessionId=str(uuid.uuid4()))]):
+            with mock.patch.object(Directory,'rows',return_value=rows):
+                current = Directory(self.box).bound(self.task)
+            self.assertEqual((current['name'],current['renamed_from']),('peer-2','peer'))
+        with mock.patch.object(Directory,'rows',return_value=[row]):
+            self.assertNotIn('renamed_from',Directory(self.box).bound(self.task))
+        self.assertEqual(self.box.get('task')['worker_name'],'peer')
+
+    def test_delegate_retry_relays_to_the_current_name_after_rename(self):
+        rows = [dict(sessionId=self.worker,name='peer-2',cwd=str(self.root))]
+        prompts = []
+
+        def relay(cli, request, *args):
+            prompts.append(Path(request).read_text())
+            return None, 1
+        with mock.patch('task_mailbox.Path.cwd',return_value=self.root), \
+             mock.patch('relay_diagnostics.run_relay',side_effect=relay), \
+             mock.patch.object(Directory,'rows',return_value=rows), \
+             mock.patch.object(hook,'notify',return_value=dict(transport='worker_hook',state='not_listening')), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            delegate(self.box,self.args())
+        self.assertIn('now named "peer-2"',prompts[0])
+        self.assertIn('peer name "peer"',prompts[0])
+        details = self.box.status('task')['delivery_diagnostics']
+        self.assertEqual((details['worker_name'],details['worker_renamed_from']),('peer-2','peer'))
+
+    def test_hook_notice_after_rename_is_queued_and_reports_both_names(self):
+        rows = [dict(sessionId=self.worker,name='peer-2',cwd=str(self.root))]
+        with mock.patch.object(hook,'ready',return_value=True), mock.patch.object(Directory,'rows',return_value=rows):
+            notice = hook.notify(self.box,self.task)
+        self.assertEqual((notice['state'],notice['worker_name'],notice['worker_renamed_from']),('queued','peer-2','peer'))
 
     def test_draft_task_never_notifies_before_requester_gates(self):
         with contextlib.redirect_stderr(io.StringIO()) as output:
