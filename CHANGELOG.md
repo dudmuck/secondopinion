@@ -8,6 +8,15 @@
   directories must be owned by this user and not group/world-writable. Routes
   store the link and re-resolve it on every connect, so daemon restarts do not
   strand them. Restart the wakeup service to load the fix.
+- Bind automatic-return registrations to the Codex conversation rather than to
+  a shared checkout. Every registered task must have that conversation as its
+  requester, and the route pins the conversation's own folder at registration,
+  so lead channels kept in another checkout can register. A conversation that
+  later moves fails closed until `wake rebind NAME --confirm-folder-change`
+  re-pins it. Result notifications are limited to the conversation's own tasks.
+- When Codex's sandbox hides the app server, `delegate --async` now exits
+  non-zero with the escalation and `wake register` commands to use, instead of
+  a bare permission error. It does not fall back silently to polling.
 
 ## 1.2.3 — 2026-09-29
 

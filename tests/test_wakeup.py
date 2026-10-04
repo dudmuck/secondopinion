@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -17,7 +18,7 @@ import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins/secondopinion/scripts"))
-from codex_wakeup import Wakeup, encode, thread_uuid, automatic_registration
+from codex_wakeup import Wakeup, AutomaticUnavailable, encode, thread_uuid, automatic_registration
 from codex_rpc import Client, ProtocolError, RpcError, socket_path, socket_target, MAX_FRAME
 
 
@@ -96,7 +97,7 @@ class WakeTests(unittest.TestCase):
 
     def register(self, tasks=("a",), **kw):
         return self.wake.register(kw.get("name", "route"), kw.get("path", str(self.socket)),
-                                  kw.get("thread", self.thread), tasks, kw.get("repo", self.repo))
+                                  kw.get("thread", self.thread), tasks)
 
     def events(self):
         return self.wake.status("route")["notifications"]
@@ -128,18 +129,82 @@ class WakeTests(unittest.TestCase):
             self.register(("a", "unknown"))
         self.assertEqual(self.wake.db.execute("SELECT count(*) FROM wake_routes").fetchone()[0], 0)
 
-    def test_wrong_checkout_rejected(self):
+    def test_task_binds_by_requester_not_checkout(self):
+        # Lead channels live in the lead's checkout while the Codex conversation works elsewhere.
         self.create("b", repo=self.root)
-        with self.assertRaises(ValueError):
-            self.register(("a", "b"))
+        self.assertEqual(self.register(("a", "b"))["tasks"], ["a", "b"])
+        self.create("c", requester=str(uuid.uuid4()))
+        with self.assertRaisesRegex(ValueError, "requester differs"):
+            self.register(("c",))
+        self.assertEqual(self.wake.status("route")["tasks"], ["a", "b"])
+
+    def test_cli_register_refuses_foreign_task_and_rebind_needs_confirmation(self):
+        self.create("c", requester=str(uuid.uuid4()))
+        script = Path(__file__).resolve().parents[1] / "plugins/secondopinion/scripts/codex_wakeup.py"
+
+        def run(*args):
+            return subprocess.run([sys.executable, "-B", str(script), "--store", str(self.root / "store"), *args],
+                                  capture_output=True, text=True, timeout=30)
+        refused = run("register", "route", "--socket", str(self.socket), "--thread", self.thread, "--task", "c")
+        self.assertEqual((refused.returncode, "requester differs" in refused.stderr), (1, True))
+        unconfirmed = run("rebind", "route")
+        self.assertEqual((unconfirmed.returncode, "--confirm-folder-change" in unconfirmed.stderr), (2, True))
+        self.assertEqual(self.wake.db.execute("SELECT count(*) FROM wake_routes").fetchone()[0], 0)
 
     def test_wrong_runtime_identity_rejected(self):
-        for key, bad in (("id", str(uuid.uuid4())), ("cwd", str(self.root)), ("ephemeral", True)):
+        for key, bad in (("id", str(uuid.uuid4())), ("ephemeral", True), ("cwd", None), ("cwd", ""),
+                         ("cwd", "relative/checkout")):
             old = self.server.thread[key]
             self.server.thread[key] = bad
-            with self.subTest(key=key), self.assertRaises(ValueError):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
                 self.register()
             self.server.thread[key] = old
+
+    def test_route_pins_the_conversation_folder_not_the_callers(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        self.server.thread["cwd"] = str(elsewhere)
+        self.assertEqual(self.register()["repo"], str(elsewhere))
+        self.update()
+        self.wake.tick("route")
+        self.assertEqual(len(self.server.sent), 1)
+
+    def test_moved_conversation_fails_closed_until_rebind(self):
+        self.register()
+        self.update()
+        moved = self.root / "moved"
+        moved.mkdir()
+        self.server.thread["cwd"] = str(moved)
+        with self.assertRaisesRegex(ValueError, "wake rebind route --confirm-folder-change"):
+            self.wake.tick("route")
+        self.assertEqual(self.server.sent, [])
+        with self.assertRaisesRegex(ValueError, "moved"):
+            self.register()  # re-registration never silently re-pins
+        self.assertEqual(self.wake.status("route")["repo"], str(self.repo))
+        status = self.wake.rebind("route")
+        self.assertEqual((status["repo"], status["status"]), (str(moved), "registered"))
+        self.wake.tick("route")
+        self.assertEqual(len(self.server.sent), 1)
+        self.assertEqual(self.wake.rebind("route")["repo"], str(moved))
+
+    def test_route_written_by_older_release_still_delivers(self):
+        # 1.2.x stored the caller's checkout, which registration required to equal the thread's folder.
+        with self.wake.box.transaction():
+            self.wake.db.execute("INSERT INTO wake_routes VALUES ('route',?,?,?,1,'registered','',?)",
+                                 (str(self.socket), self.thread, str(self.repo.resolve()), "2026-09-17T00:00:00+00:00"))
+            self.wake.db.execute("INSERT INTO wake_tasks VALUES ('route','a')")
+        self.update()
+        self.wake.tick("route")
+        self.assertEqual(len(self.server.sent), 1)
+
+    def test_foreign_task_reaching_a_route_is_never_surfaced(self):
+        self.register()
+        self.create("b", requester=str(uuid.uuid4()))
+        with self.wake.box.transaction():
+            self.wake.db.execute("INSERT INTO wake_tasks VALUES ('route','b')")
+        self.update("b")
+        self.wake.tick("route")
+        self.assertEqual((self.server.sent, self.events()), ([], []))
 
     def test_cannot_register_closed_thread(self):
         self.server.thread["status"] = {"type": "notLoaded"}
@@ -372,13 +437,27 @@ class WakeTests(unittest.TestCase):
     def test_automatic_registration_rejects_foreign_caller(self):
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": str(uuid.uuid4())}):
             with self.assertRaises(ValueError):
-                automatic_registration(self.root / "store", "a", self.thread, self.repo)
+                automatic_registration(self.root / "store", "a", self.thread)
         self.assertEqual(self.server.calls, [])
 
     def test_automatic_registration_requires_live_service_before_any_delivery(self):
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": self.thread}):
             with self.assertRaisesRegex(ValueError, "service is unavailable"):
-                automatic_registration(self.root / "store", "a", self.thread, self.repo)
+                automatic_registration(self.root / "store", "a", self.thread)
+        self.assertEqual(self.wake.box.get("a")["state"], "created")
+
+    def test_sandboxed_registration_fails_clearly_without_registering(self):
+        denied = PermissionError(13, "Permission denied", "/tmp/codex-daemon-1000/hash")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": self.thread}), \
+                mock.patch.object(Wakeup, "service_running", return_value=True), \
+                mock.patch("codex_rpc.socket_target", side_effect=denied):
+            with self.assertRaisesRegex(ValueError, "inside the sandbox") as caught:
+                automatic_registration(self.root / "store", "a", self.thread)
+        # Not AutomaticUnavailable: that would quietly fall back to a foreground wait.
+        self.assertNotIsInstance(caught.exception, AutomaticUnavailable)
+        self.assertIn("wake register codex-" + self.thread, str(caught.exception))
+        self.assertIn("--task a", str(caught.exception))
+        self.assertEqual(self.wake.db.execute("SELECT count(*) FROM wake_routes").fetchone()[0], 0)
         self.assertEqual(self.wake.box.get("a")["state"], "created")
 
     def test_running_tasks_do_not_cause_codex_rpc_polling(self):
@@ -523,10 +602,10 @@ class SocketLinkTests(unittest.TestCase):
         wake = Wakeup(self.root / "store", factory)
         self.addCleanup(wake.db.close)
         wake.box.create("a", "worker-a", thread, str(repo), "authorized reporting-only task")
-        self.assertEqual(wake.register("route", str(self.link), thread, ["a"], repo)["socket"], str(self.link))
+        self.assertEqual(wake.register("route", str(self.link), thread, ["a"])["socket"], str(self.link))
         self.start("b2")
         # A stored resolved path would now be stale and refuse as a retarget.
-        wake.register("route", str(self.link), thread, ["a"], repo)
+        wake.register("route", str(self.link), thread, ["a"])
         report = self.root / "result"
         report.write_text("verified result")
         wake.box.claim("a", "worker-a")

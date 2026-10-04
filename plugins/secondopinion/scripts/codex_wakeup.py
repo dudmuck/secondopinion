@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import stat
 import sys
@@ -40,6 +41,13 @@ def thread_uuid(value):
     return value
 
 
+def thread_folder(thread):
+    cwd = thread.get("cwd")
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        raise ValueError("Codex thread reports no absolute working folder")
+    return str(Path(cwd).resolve())
+
+
 class Wakeup:
     def __init__(self, store, client_factory=Client):
         self.box = Mailbox(store)
@@ -47,6 +55,8 @@ class Wakeup:
         self.conversation = Conversation(self.box)
         self.client_factory = client_factory
         with self.box.transaction():
+            # repo is the conversation's own folder, pinned at registration; tasks bind
+            # by requester, so their checkouts may differ. Only wake rebind re-pins it.
             self.db.execute("""CREATE TABLE IF NOT EXISTS wake_routes (
                 name TEXT PRIMARY KEY, socket TEXT NOT NULL, thread TEXT NOT NULL UNIQUE,
                 repo TEXT NOT NULL, enabled INTEGER NOT NULL, status TEXT NOT NULL,
@@ -112,14 +122,26 @@ class Wakeup:
         finally:
             os.close(fd)
 
-    def _thread(self, client, route):
-        thread = client.call("thread/read", {"threadId": route["thread"]})["thread"]
-        if thread.get("id") != route["thread"] or thread.get("ephemeral") is not False or \
-                str(Path(thread.get("cwd", "")).resolve()) != route["repo"]:
-            raise ValueError("Codex thread identity, persistence or checkout does not match registration")
+    @staticmethod
+    def _read(client, thread_id):
+        thread = client.call("thread/read", {"threadId": thread_id})["thread"]
+        if thread.get("id") != thread_id or thread.get("ephemeral") is not False:
+            raise ValueError("Codex thread identity or persistence does not match registration")
         return thread
 
-    def register(self, name, path, thread, task_ids, repo):
+    @staticmethod
+    def _pinned(route, thread):
+        # A conversation re-pointed at another folder fails closed until an operator rebinds it.
+        if thread_folder(thread) != route["repo"]:
+            raise ValueError("Codex thread moved to another folder since registration; confirm the move, then run "
+                             "`secondopinion wake rebind " + route["name"] + " --confirm-folder-change`")
+
+    def _thread(self, client, route):
+        thread = self._read(client, route["thread"])
+        self._pinned(route, thread)
+        return thread
+
+    def register(self, name, path, thread, task_ids):
         identifier(name)
         if name == "service":
             raise ValueError("reserved wakeup registration name")
@@ -127,15 +149,19 @@ class Wakeup:
         tasks = sorted(set(task_ids))
         if not 1 <= len(tasks) <= 256:
             raise ValueError("register between 1 and 256 explicit existing task IDs")
-        route = dict(name=name, socket=socket_path(path), thread=thread, repo=str(Path(repo).resolve()))
         for task_id in tasks:
-            if self.box.get(task_id)["repo"] != route["repo"]:
-                raise ValueError("task checkout does not match registration")
+            # The requester binding, not a shared checkout, ties each task to this conversation.
+            if self.box.get(task_id)["requester"] != thread:
+                raise ValueError("task requester differs from the registered Codex conversation")
+        socket = socket_path(path)
         existing = self.db.execute("SELECT * FROM wake_routes WHERE name=?", (name,)).fetchone()
-        if existing and any(existing[k] != route[k] for k in ("socket", "thread", "repo")):
+        if existing and (existing["socket"], existing["thread"]) != (socket, thread):
             raise ValueError("cannot retarget an existing registration")
-        with self.client_factory(route["socket"]) as client:
-            target = self._thread(client, route)
+        with self.client_factory(socket) as client:
+            target = self._read(client, thread)
+            route = dict(name=name, socket=socket, thread=thread, repo=thread_folder(target))
+            if existing:
+                self._pinned(existing, target)
             if target["status"]["type"] not in ("idle", "active"):
                 raise ValueError("open/resume the target Codex conversation before registering")
             # Capability check is read-only: no thread is loaded, resumed or woken.
@@ -164,6 +190,20 @@ class Wakeup:
         self.route(name)
         with self.box.transaction():
             self.db.execute("UPDATE wake_routes SET enabled=0,status='disabled',updated_utc=? WHERE name=?", (utc(), name))
+        return self.status(name)
+
+    def rebind(self, name):
+        """Operator-confirmed re-pin after a deliberate move of the same conversation."""
+        route = self.route(name)
+        with self.client_factory(route["socket"]) as client:
+            folder = thread_folder(self._read(client, route["thread"]))
+        with self.box.transaction():
+            current = self.route(name)
+            if any(current[k] != route[k] for k in ("socket", "thread", "repo")):
+                raise ValueError("registration changed concurrently")
+            self.db.execute("UPDATE wake_routes SET repo=?,updated_utc=? WHERE name=?", (folder, utc(), name))
+        if folder != route["repo"]:
+            self.set_status(name, "registered")
         return self.status(name)
 
     def collect(self, name):
@@ -195,7 +235,8 @@ class Wakeup:
                         body = encode(payload)
                         self.db.execute("INSERT INTO wake_message_outbox VALUES (?,?,?,?,?,?,'prepared',NULL,0,'',?)",
                                         (event_id, name, task['id'], message['id'], body, digest(body), utc()))
-                if task["state"] not in TERMINAL | {"needs_attention"}:
+                # Registration binds tasks by requester; never surface another lead's outcome.
+                if task["requester"] != consumer or task["state"] not in TERMINAL | {"needs_attention"}:
                     continue
                 ack = self.db.execute("SELECT revision FROM acknowledgments WHERE task_id=? AND consumer=?",
                                       (task["id"], consumer)).fetchone()
@@ -408,7 +449,7 @@ def default_socket():
                "app-server-control/app-server-control.sock")
 
 
-def automatic_registration(store, task, requester, repo):
+def automatic_registration(store, task, requester):
     """Called only by explicit async delegation, before contacting the worker."""
     if requester != os.environ.get("CODEX_THREAD_ID"):
         raise ValueError("automatic return requires the calling Codex thread identity; use foreground delegation here")
@@ -424,9 +465,16 @@ def automatic_registration(store, task, requester, repo):
                 target = client.call("thread/read", {"threadId": requester})["thread"]
                 if target.get("status", {}).get("type") not in ("idle", "active"):
                     raise AutomaticUnavailable("this conversation is not connected to the local return server")
-            return wake.register("codex-" + requester, default_socket(), requester, [task], repo)
+            return wake.register("codex-" + requester, default_socket(), requester, [task])
         except (FileNotFoundError, ConnectionRefusedError) as error:
             raise AutomaticUnavailable("local Codex return server is unavailable") from error
+        except PermissionError as error:
+            # Codex's sandbox hides the server on purpose; do not degrade silently to polling.
+            raise ValueError(
+                "automatic return cannot reach the Codex app server from inside the sandbox. Rerun this same "
+                "delegate --async command with escalation (needed once per channel), or register from a normal "
+                "terminal: secondopinion wake register " + shlex.join(["codex-" + requester, "--socket", default_socket(),
+                "--thread", requester, "--task", task]) + ". Otherwise use a foreground wait or task receive.") from error
     finally:
         wake.db.close()
 
@@ -443,21 +491,24 @@ def main():
     register.add_argument("--socket", required=True)
     register.add_argument("--thread", required=True)
     register.add_argument("--task", action="append", required=True)
-    for name in ("status", "disable", "watch", "reconcile", "retry"):
-        command = commands.add_parser(name)
+    for name in ("status", "disable", "watch", "reconcile", "retry", "rebind"):
+        command = commands.add_parser(name, **({"help": "re-pin a registration to its conversation's new folder "
+                                                "after a deliberate move"} if name == "rebind" else {}))
         command.add_argument("name")
         if name == "watch":
             command.add_argument("--timeout", type=bounded, default=86400)
         if name == "retry":
             command.add_argument("notification_id")
             command.add_argument("--confirm-not-delivered", action="store_true", required=True)
+        if name == "rebind":
+            command.add_argument("--confirm-folder-change", action="store_true", required=True)
     args = parser.parse_args()
     wake = Wakeup(args.store)
     try:
         if args.command == "serve":
             wake.serve(args.timeout)
         elif args.command == "register":
-            emit(wake.register(args.name, args.socket, args.thread, args.task, Path.cwd()))
+            emit(wake.register(args.name, args.socket, args.thread, args.task))
         elif args.command == "watch":
             return wake.watch(args.name, args.timeout)
         elif args.command == "reconcile":

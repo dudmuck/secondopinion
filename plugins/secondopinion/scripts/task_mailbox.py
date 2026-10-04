@@ -481,7 +481,7 @@ def delegate(box, args):
         # It never starts/resumes a Codex conversation or bypasses a permission.
         from codex_wakeup import automatic_registration, AutomaticUnavailable
         try:
-            notification = automatic_registration(box.store, args.id, args.requester, str(Path.cwd().resolve()))
+            notification = automatic_registration(box.store, args.id, args.requester)
         except AutomaticUnavailable as error:
             print(str(error) + "; waiting for the worker in this call instead.", file=sys.stderr)
     # Serialize deliveries of one task without holding a database transaction over Claude.

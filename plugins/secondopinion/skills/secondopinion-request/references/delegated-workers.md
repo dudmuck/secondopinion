@@ -307,6 +307,16 @@ collection. If fallback times out while monitoring remains authorized, keep
 collecting the same task IDs; do not yield and leave the user to discover reports.
 Neither mode grants execution authority or bypasses a worker's approval blocker.
 
+Registration is the only step that needs the Codex server socket, which Codex's
+sandbox hides on purpose. If `delegate --async` reports that it cannot reach the
+server from inside the sandbox, rerun that same command once with escalation, or
+ask the user to run the `wake register` command it prints; never widen the sandbox.
+A registration binds tasks to this conversation by requester and pins the
+conversation's folder at that moment, so tasks in another checkout are fine. If
+the conversation later moves to another folder, deliveries stop fail-closed until
+the user confirms with `secondopinion wake rebind codex-CODEX_THREAD_ID
+--confirm-folder-change`.
+
 For diagnostics, use `secondopinion wake status codex-CODEX_THREAD_ID`. The outbox
 distinguishes prepared, accepted, recorded and ambiguous delivery; recorded means
 present in Codex history, not consumed. Service restarts reconcile positive history

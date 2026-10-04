@@ -891,7 +891,12 @@ class WakeConversationTests(unittest.TestCase):
     def test_no_notification_to_a_different_task_consumer(self):
         self.create('b', requester='other-lead')
         self.question(task='b')
-        self.register(('b',))
+        with self.assertRaisesRegex(ValueError, 'requester differs'):
+            self.register(('b',))
+        # Even a route row that reaches another lead's task never surfaces its messages.
+        self.register()
+        with self.wake.box.transaction():
+            self.wake.db.execute("INSERT INTO wake_tasks VALUES ('route','b')")
         self.wake.tick('route')
         self.assertEqual(self.server.sent, [])
 
