@@ -23,6 +23,17 @@
   keeps the requester's original binding; the hook notice, relay prompt and
   delivery diagnostics report both names. Previously every send failed with
   `bound worker name changed or became ambiguous` until the name was restored.
+- Keep a bound Claude worker reachable when Claude resumes its conversation under
+  a new session ID (`--fork-session`, used by background sessions). The new
+  session's hook continues the old session's tasks automatically, using its own
+  launch arguments as evidence, once the old session has left the public
+  listing. `task worker-continue --from OLD --to NEW` covers resumes without that
+  evidence. Tasks keep their bound worker ID for claims and messages; hook
+  reminders name it for each task. Senders and relays follow the recorded
+  continuation, and the sender's error now explains the recovery when the bound
+  session is gone. Background sessions count as workers; headless responders
+  still do not. Previously the new session got no notices and every sender
+  failed with `bound worker is absent, ambiguous or in a different checkout`.
 
 ## 1.2.3 — 2026-09-29
 

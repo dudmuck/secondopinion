@@ -420,7 +420,16 @@ complete before the requested work and its required restoration/validation have 
 def relay_prompt(task, cli, store, content=None, receipt_command=None):
     command = shlex.join(["env", f"SECONDOPINION_DIR={store}", cli, "task"])
     route = ""
-    if task["worker_name"] and task.get("worker_renamed_from"):
+    if task.get("worker_host"):
+        route = f"""The bound worker session {task['worker']} continues as Claude session
+{task['worker_host']}: the same conversation, resumed in the same checkout under a new
+session ID (a recorded continuation). Its current exact peer name is
+{json.dumps(task['worker_name'])}. Require exactly one ListAgents peer with that exact name
+and send to its messaging reference. If ListAgents also exposes a UUID it must be
+{task['worker_host']}. Do not fall back to any other name. If the name is absent or
+ambiguous, fail.
+"""
+    elif task["worker_name"] and task.get("worker_renamed_from"):
         route = f"""The requester bound this UUID to the peer name {json.dumps(task['worker_renamed_from'])}.
 A fresh public host-side worker listing shows the same session (same UUID and
 checkout) now named {json.dumps(task['worker_name'])}. Use that current name: require exactly
@@ -454,7 +463,7 @@ An empty sandboxed CLI listing is not proof that the worker stopped.
     if receipt_command is None:
         receipt_command = f"{command} delivered {shlex.quote(task['id'])} --receipt 'ACTUAL_MESSAGE_RECEIPT'"
     return f"""You are a delivery relay for an existing Claude worker, not its executor.
-Resolve ONLY the exact session {task['worker']}.
+Resolve ONLY the exact session {task.get('worker_host') or task['worker']}.
 {route}
 Do not guess a peer,
 start another worker, resume a private session, or take over a team. If ListAgents or
@@ -516,15 +525,16 @@ def delegate(box, args):
                 delivery_state = 'unconfirmed'
         if not task["delivery_receipt"] and task["state"] == "created" and delivery_state == 'unconfirmed':
             relay_task = task
-            if task["worker_name"]:
-                # A retry after the bound worker restarted must address its current name.
-                try:
-                    from worker_directory import Directory
-                    current = Directory(box).bound(task)
-                    if current.get("renamed_from"):
-                        relay_task = dict(task, worker_name=current["name"], worker_renamed_from=current["renamed_from"])
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    pass  # the relay itself still requires the recorded exact name
+            # A retry after the bound worker restarted must address its current
+            # session and name.
+            try:
+                from worker_directory import Directory
+                current = Directory(box).bound(task)
+                if current.get("continued_from") or (task["worker_name"] and current.get("renamed_from")):
+                    relay_task = dict(task, worker_name=current["name"], worker_renamed_from=current.get("renamed_from"),
+                                      worker_host=current["sessionId"] if current.get("continued_from") else None)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass  # the relay itself still requires the recorded session or exact name
             with tempfile.TemporaryDirectory(prefix="task-relay-", dir=box.store) as tmp:
                 prompt = Path(tmp) / "request.md"
                 prompt.write_text(relay_prompt(relay_task, args.cli, box.store), encoding="utf-8")
@@ -540,6 +550,8 @@ def delegate(box, args):
                     diagnostics['worker_directory_match'] = True
                     if current.get('renamed_from'):
                         diagnostics.update(worker_name=current['name'], worker_renamed_from=current['renamed_from'])
+                    if current.get('continued_from'):
+                        diagnostics.update(worker_session=current['sessionId'], worker_continued_from=current['continued_from'])
                 except WorkerMismatch as error:
                     diagnostics['worker_directory_match'] = False
                     diagnostics['worker_directory_reason'] = str(error)
@@ -617,6 +629,11 @@ def parser():
             sub.add_argument("--revision", type=int, required=True)
         if name == "wait":
             sub.add_argument("--timeout", type=bounded, default=900)
+    resumed = commands.add_parser("worker-continue", help="record that an exited worker session's conversation "
+                                  "now runs as a new Claude session in this checkout (hooks do this automatically "
+                                  "when the launch shows --fork-session --resume)")
+    resumed.add_argument("--from", dest="previous", required=True)
+    resumed.add_argument("--to", dest="session", required=True)
     inbox = commands.add_parser("inbox", help="unconsumed terminal/attention events; never auto-acks")
     inbox.add_argument("--consumer", required=True)
     inbox.add_argument("--repo", default=str(Path.cwd().resolve()))
@@ -686,6 +703,10 @@ def main():
             return 0 if task["state"] == "complete" else 3
         elif command == "inbox":
             emit(box.pending(args.consumer, repo=args.repo))
+        elif command == "worker-continue":
+            from worker_directory import Directory
+            emit(Directory(box).continue_session(args.previous, args.session, Path.cwd(),
+                                                 "explicit: task worker-continue"))
         elif command == "wait-any":
             return box.wait_any(args.ids, args.consumer, args.timeout)
         return 0

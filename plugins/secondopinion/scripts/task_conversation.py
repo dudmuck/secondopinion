@@ -343,7 +343,8 @@ def deliver(conversation, task_id, message_id, session, cli, timeout, retry=Fals
         # address the session's current name; the original task route is fixed.
         from worker_directory import Directory
         current = Directory(box).bound(task)
-        task = dict(task, worker_name=current['name'], worker_renamed_from=current.get('renamed_from'))
+        task = dict(task, worker_name=current['name'], worker_renamed_from=current.get('renamed_from'),
+                    worker_host=current['sessionId'] if current.get('continued_from') else None)
         attempt = str(uuid.uuid4())
         expected_state = message['delivery']['state']
         expected_attempt = message['delivery']['attempt']
@@ -385,6 +386,8 @@ def deliver(conversation, task_id, message_id, session, cli, timeout, retry=Fals
         details['attempt'] = attempt
         if task['worker_renamed_from']:
             details.update(worker_name=task['worker_name'], worker_renamed_from=task['worker_renamed_from'])
+        if task['worker_host']:
+            details.update(worker_session=task['worker_host'], worker_continued_from=task['worker'])
         notification = None
         if message['delivery']['receipt']:
             details.update(stage='receipt', reason='receipt_persisted')

@@ -113,7 +113,12 @@ be nonempty UTF-8, at most 16 KiB. The mailbox snapshots them immediately.
 
 Lead messages use a listening worker hook or a bounded relay to the same existing worker. The plugin
 rechecks its UUID and checkout on every attempt and sends to its current, unique
-name, so a worker renamed by a restart keeps its tasks. Worker messages
+name, so a worker renamed by a restart keeps its tasks. If Claude resumes the
+worker's conversation under a new session ID (`--fork-session`, as background
+sessions do), the new session's hook continues its tasks once the old session has
+exited; without that launch evidence, run `secondopinion task worker-continue
+--from OLD --to NEW` in the checkout. The worker keeps its original session ID for
+task commands. Worker messages
 are stored immediately and automatically notify the registered lead, including
 when idle, as `secondopinion_message`. Workers waiting for answers can end their
 turn; the lead's reply notifies that same worker through its hook or native relay.

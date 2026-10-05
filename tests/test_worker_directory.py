@@ -82,6 +82,52 @@ class DirectoryTests(unittest.TestCase):
         self.output([dict(self.row, kind="headless")])
         self.assertEqual(self.directory.rows(), [])
 
+    def test_background_session_is_a_worker(self):
+        self.output([dict(self.row, kind="background")])
+        self.assertEqual(self.directory.rows(), [dict(self.row, kind="background")])
+
+    def bound_task(self):
+        old, new = str(uuid.uuid4()), str(uuid.uuid4())
+        self.wake.box.create("chan", old, "lead", str(self.root), "standing channel", "named worker")
+        return old, new
+
+    def test_forked_session_continues_an_exited_worker(self):
+        old, new = self.bound_task()
+        self.output([dict(self.row, sessionId=new, kind="background")])
+        with self.assertRaisesRegex(ValueError, "worker-continue --from " + old):
+            self.directory.bound(self.wake.box.get("chan"))
+        result = self.directory.continue_session(old, new, self.root, "test")
+        self.assertEqual((result["workers"], result["tasks"]), ([old], ["chan"]))
+        current = self.directory.bound(self.wake.box.get("chan"))
+        self.assertEqual((current["sessionId"], current["continued_from"]), (new, old))
+        self.assertEqual(self.wake.box.get("chan")["worker"], old)  # claims and messages keep the bound ID
+        self.assertEqual([tuple(r) for r in self.wake.db.execute("SELECT previous, host FROM worker_continuation_log")],
+                         [(old, new)])
+
+    def test_chained_resume_follows_to_the_latest_session(self):
+        old, new = self.bound_task()
+        newer = str(uuid.uuid4())
+        self.output([dict(self.row, sessionId=new)])
+        self.directory.continue_session(old, new, self.root, "first")
+        self.output([dict(self.row, sessionId=newer)])
+        self.assertEqual(self.directory.continue_session(new, newer, self.root, "second")["workers"], sorted([old, new]))
+        self.assertEqual(self.directory.bound(self.wake.box.get("chan"))["sessionId"], newer)
+
+    def test_continuation_refused_unless_safe(self):
+        old, new = self.bound_task()
+        other = self.root / "other"
+        other.mkdir()
+        for rows, message in (([dict(self.row, sessionId=old), dict(self.row, sessionId=new, name="b")], "still running"),
+                              ([], "not running"), ([dict(self.row, sessionId=new, cwd=str(other))], "not running")):
+            self.output(rows)
+            with self.subTest(message=message, rows=len(rows)), self.assertRaisesRegex(ValueError, message):
+                self.directory.continue_session(old, new, self.root, "test")
+        self.output([dict(self.row, sessionId=new)])
+        for previous, message in ((str(uuid.uuid4()), "no task"), (new, "itself"), ("not-a-uuid", "UUID")):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.directory.continue_session(previous, new, self.root, "test")
+        self.assertEqual(self.wake.db.execute("SELECT count(*) FROM worker_continuations").fetchone()[0], 0)
+
     def test_private_or_unneeded_metadata_not_published(self):
         self.output([dict(self.row, pid=123, arbitrary="do not persist", startedAt=1234)])
         self.assertEqual(self.directory.rows(), [self.row])

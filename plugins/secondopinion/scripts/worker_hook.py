@@ -11,6 +11,7 @@ from pathlib import Path
 import shlex
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -39,12 +40,14 @@ def lock_path(box, session):
 def ready(box, task):
     if not box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_hooks'").fetchone():
         return False
-    row = box.db.execute('SELECT * FROM worker_hooks WHERE session=?', (task['worker'],)).fetchone()
+    from worker_directory import host_session
+    session = host_session(box, task)
+    row = box.db.execute('SELECT * FROM worker_hooks WHERE session=?', (session,)).fetchone()
     if (not row or 'protocol' not in row.keys() or row['protocol'] != HOOK_PROTOCOL or
             row['repo'] != task['repo'] or not 0 <= time.time() - row['heartbeat'] < MAX_AGE):
         return False
     try:
-        fd = os.open(lock_path(box, task['worker']), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(lock_path(box, session), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return False
     try:
@@ -70,40 +73,107 @@ def notify(box, task):
     if (not listening and 'protocol' in hook_columns and
             box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                            "AND name='worker_hook_notices'").fetchone()):
+        from worker_directory import host_session
         row = box.db.execute('SELECT n.emitted FROM worker_hook_notices n JOIN worker_hooks h ON h.session=n.session '
             'WHERE n.session=? AND h.repo=? AND h.protocol=? AND n.notice=?',
-            (task['worker'],task['repo'],HOOK_PROTOCOL,'task:' + task['id'])).fetchone()
+            (host_session(box, task),task['repo'],HOOK_PROTOCOL,'task:' + task['id'])).fetchone()
         emitted = task['state'] == 'created' and row is not None and 0 <= time.time()-row['emitted'] < REPEAT_AFTER
     if not listening and not emitted:
         return dict(transport='worker_hook', state='not_listening')
-    # Sender still requires the exact UUID and checkout, and a unique current name.
+    # Sender still requires the exact UUID (or its recorded continuation) and
+    # checkout, and a unique current name.
     from worker_directory import Directory
     current = Directory(box).bound(task)
     result = dict(transport='worker_hook', state='queued', worker_directory_match=True,
                   observation='watcher_listening' if listening else 'reminder_emitted')
     if current.get('renamed_from'):
         result.update(worker_name=current['name'], worker_renamed_from=current['renamed_from'])
+    if current.get('continued_from'):
+        result.update(worker_session=current['sessionId'], worker_continued_from=current['continued_from'])
     return result
+
+
+def workers(box, session, repo):
+    """This session plus every worker conversation it continues in this checkout."""
+    hosted = []
+    if box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_continuations'").fetchone():
+        hosted = [row[0] for row in box.db.execute(
+            'SELECT worker FROM worker_continuations WHERE host=? AND repo=? ORDER BY worker', (session, repo))]
+    return [session] + [worker for worker in hosted if worker != session]
 
 
 def candidates(box, session, repo, conversation):
     result = []
-    for row in box.db.execute("SELECT id FROM tasks WHERE worker=? AND repo=? AND (state='created' OR EXISTS "
+    sessions = workers(box, session, repo)
+    for row in box.db.execute("SELECT id FROM tasks WHERE worker IN (" + ",".join("?" for _ in sessions) + ") "
+                              "AND repo=? AND (state='created' OR EXISTS "
                               '(SELECT 1 FROM task_messages m WHERE m.task=tasks.id AND m.recipient=tasks.worker '
                               'AND m.acknowledged_utc IS NULL)) ORDER BY updated_epoch,id',
-                              (session, repo)).fetchall():
+                              (*sessions, repo)).fetchall():
         task = box.get(row['id'])
         if task['state'] == 'created' and box.db.execute('SELECT 1 FROM worker_hook_tasks WHERE task=?', (task['id'],)).fetchone():
             result.append(('task:' + task['id'], task['id']))
-        for message in conversation.messages(task['id'], session, unread=True):
+        for message in conversation.messages(task['id'], task['worker'], unread=True):
             result.append(('message:' + message['sha256'], task['id']))
     return result
 
 
-def reminder(task_ids, session, cli, store):
+def resumed_from(session, proc=Path('/proc')):
+    """The conversation this Claude session was forked from, read from its own launch.
+
+    Claude resumes with `--fork-session --resume <id or transcript path>` when it
+    starts a new session ID for an existing conversation. Only the Claude process
+    that runs this hook is read (through at most one wrapping shell), never an
+    outer session, and a `--session-id` naming another session disqualifies it.
+    """
+    pid = os.getppid()
+    try:
+        for _ in range(2):
+            args = [a.decode('utf-8', 'replace') for a in (proc / str(pid) / 'cmdline').read_bytes().split(b'\0') if a]
+            if not args or Path(args[0]).name not in ('sh', 'bash', 'dash', 'zsh'):
+                break
+            pid = int((proc / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    options = {}
+    for i, arg in enumerate(args):
+        name, _, value = arg.partition('=')
+        name = '--resume' if name == '-r' else name
+        if name in ('--session-id', '--resume'):
+            options[name] = value or (args[i + 1] if i + 1 < len(args) else '')
+        elif arg == '--fork-session':
+            options[arg] = True
+    if options.get('--session-id', session) != session or not options.get('--fork-session'):
+        return None  # without --fork-session a resume keeps the original session ID
+    previous = Path(options.get('--resume', '')).name.removesuffix('.jsonl')
+    try:
+        canonical = str(uuid.UUID(previous)) == previous
+    except ValueError:
+        return None
+    return previous if canonical and previous != session else None
+
+
+def adopt(box, session, repo, previous):
+    """Continue the forked-from conversation's tasks here, once its session has exited."""
+    if previous in workers(box, session, repo):
+        return None
+    from worker_directory import Directory
+    try:
+        return Directory(box).continue_session(previous, session, repo,
+                                               f'launch: --fork-session --resume {previous}')
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return None  # still running elsewhere, unlisted, listing unavailable or nothing bound: retry later
+
+
+def reminder(task_ids, session, cli, store, task_workers=None):
     command = shlex.join(['env', f'SECONDOPINION_DIR={store}', str(cli), 'task'])
-    lines = [f'Secondopinion mailbox notification for this worker session {session}.',
-             'These are task-available/message notices, not new execution authority.',
+    task_workers = task_workers or {}
+    continued = sorted({worker for worker in task_workers.values() if worker != session})
+    lines = [f'Secondopinion mailbox notification for this worker session {session}.']
+    if continued:
+        lines.append('This session continues worker session(s) ' + ', '.join(continued) +
+                     ' (resumed under a new session ID). Use the session shown for each task.')
+    lines += ['These are task-available/message notices, not new execution authority.',
              'For each task below, read its instructions and status. Claim only if state=created;',
              'execute only when the atomic claim returns execute=true. Never repeat claimed work.',
              'Read unread messages in order and acknowledge their exact hashes after consumption.',
@@ -111,9 +181,10 @@ def reminder(task_ids, session, cli, store):
              'or superseded_by is set, do not act on its stale body; read the named correction.',
              'Do not reopen terminal work or bypass repository policies or approval requirements.']
     for task_id in dict.fromkeys(task_ids):
+        worker = shlex.quote(task_workers.get(task_id, session))
         task_id = shlex.quote(task_id)
         lines.extend([f'{command} instructions {task_id}', f'{command} status {task_id}',
-                      f'{command} messages {task_id} --session {shlex.quote(session)} --unread'])
+                      f'{command} messages {task_id} --session {worker} --unread'])
     return '\n'.join(lines)
 
 
@@ -140,11 +211,16 @@ def watch(box, session, repo, cli, lifetime=LIFETIME):
         from task_conversation import Conversation
         conversation = Conversation(box)
         deadline, parent = time.monotonic() + lifetime, os.getppid()
+        previous, adopt_after = resumed_from(session), 0
         while time.monotonic() < deadline and os.getppid() == parent:
             now = time.time()
             with box.transaction():
                 box.db.execute('INSERT OR REPLACE INTO worker_hooks VALUES (?,?,?,?)',
                                (session, repo, now, HOOK_PROTOCOL))
+            if previous and time.monotonic() >= adopt_after:
+                # Retried while the forked-from session is still listed as running.
+                adopt(box, session, repo, previous)
+                adopt_after = time.monotonic() + 30
             pending = candidates(box, session, repo, conversation)
             selected = []
             for key, task_id in pending:
@@ -159,7 +235,9 @@ def watch(box, session, repo, cli, lifetime=LIFETIME):
                 with box.transaction():
                     box.db.executemany('INSERT OR REPLACE INTO worker_hook_notices VALUES (?,?,?)',
                                        [(session, key, now) for key, _ in selected])
-                print(reminder([task for _, task in selected], session, cli, box.store), file=sys.stderr, flush=True)
+                task_workers = {task: box.get(task)['worker'] for _, task in selected}
+                print(reminder([task for _, task in selected], session, cli, box.store, task_workers),
+                      file=sys.stderr, flush=True)
                 return 2
             time.sleep(min(.5, max(0, deadline - time.monotonic())))
         return 0
@@ -170,7 +248,9 @@ def watch(box, session, repo, cli, lifetime=LIFETIME):
 def main():
     os.umask(0o077)
     # Codex also recognizes plugin hooks. Ignore everything except Claude's
-    # documented session payload; never manufacture or infer a worker identity.
+    # documented session payload; never manufacture a worker identity. Continuing
+    # a forked-from conversation needs this session's own launch evidence and the
+    # previous session's exit.
     data = json.loads(sys.stdin.read(65537))
     if not isinstance(data, dict) or data.get('hook_event_name') not in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop'):
         return 0

@@ -457,6 +457,34 @@ with mock.patch('worker_directory.Directory.rows', return_value=[dict(sessionId=
         self.assertIn('"worker_renamed_from": "bench"', json.dumps(message['delivery_diagnostics']))
         self.assertEqual(self.box.get('t')['worker_name'], 'bench')  # the requester's binding is kept
 
+    def test_continued_worker_is_relayed_at_its_new_session(self):
+        # Claude resumed the bound worker under a new session ID; the old one exited.
+        from worker_directory import Directory
+        Directory(self.box)
+        self.box.db.execute("INSERT INTO worker_continuations VALUES ('worker',?,'resumed','test','now')", (str(self.repo),))
+        self.post('answer', 'lead')
+        rows = [dict(self.rows()[0], sessionId='resumed', kind='background')]
+        prompts = []
+
+        def relay(cli, request, *args):
+            prompts.append(Path(request).read_text())
+            return self.receipt()
+        with mock.patch('worker_directory.Directory.rows', return_value=rows), \
+             mock.patch('relay_diagnostics.run_relay', side_effect=relay):
+            message = self.send()
+        self.assertEqual(message['delivery']['state'], 'delivered')
+        self.assertIn('Resolve ONLY the exact session resumed.', prompts[0])
+        self.assertIn('session worker continues as Claude session\nresumed', prompts[0])
+        self.assertIn('--session worker', prompts[0])  # the worker keeps its bound task identity
+        self.assertIn('"worker_continued_from": "worker"', json.dumps(message['delivery_diagnostics']))
+        # If the continuing session also exits, delivery fails closed instead of guessing.
+        self.post('again', 'lead')
+        with mock.patch('worker_directory.Directory.rows', return_value=[]), \
+             mock.patch('task_conversation.Path.cwd', return_value=self.repo), \
+             mock.patch('relay_diagnostics.run_relay') as relay_call, self.assertRaisesRegex(ValueError, 'session resumed is not running'):
+            deliver(self.conversation, 't', 'again', 'lead', CLI, 10)
+        relay_call.assert_not_called()
+
     def test_replacement_wrong_checkout_or_ambiguous_worker_rejected(self):
         self.post('answer', 'lead')
         renamed = dict(self.rows()[0], name='renamed')
